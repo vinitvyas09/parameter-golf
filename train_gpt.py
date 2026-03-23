@@ -92,7 +92,7 @@ class Hyperparameters:
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 16))
 
     # SWA (stochastic weight averaging).
-    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.5))
+    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
     swa_every = int(os.environ.get("SWA_EVERY", 25))
 
 # -----------------------------
