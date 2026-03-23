@@ -91,6 +91,10 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 256))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 16))
 
+    # SWA (stochastic weight averaging).
+    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.5))
+    swa_every = int(os.environ.get("SWA_EVERY", 50))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -1087,6 +1091,9 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
+    swa_state: dict[str, Tensor] | None = None
+    swa_count = 0
+
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1156,6 +1163,18 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        # SWA: accumulate weight snapshots during warmdown
+        if scale < args.swa_start_frac and step % args.swa_every == 0:
+            if swa_state is None:
+                swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
+                swa_count = 1
+                log0(f"swa:start step:{step}")
+            else:
+                for name, t in base_model.state_dict().items():
+                    swa_state[name] += t.detach().cpu()
+                swa_count += 1
+                log0(f"swa:checkpoint step:{step} count:{swa_count}")
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1181,6 +1200,18 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+
+    # Apply SWA averaged weights
+    if swa_state is not None and swa_count > 1:
+        log0(f"swa:applying averaged {swa_count} checkpoints")
+        current_state = base_model.state_dict()
+        avg_state = {
+            name: (tensor / swa_count).to(dtype=current_state[name].dtype)
+            for name, tensor in swa_state.items()
+        }
+        base_model.load_state_dict(avg_state, strict=True)
+    elif swa_count <= 1:
+        log0("swa:skipped (not enough checkpoints)")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
