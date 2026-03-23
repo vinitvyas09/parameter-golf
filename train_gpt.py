@@ -65,7 +65,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -88,7 +88,7 @@ class Hyperparameters:
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
 
     # Sliding-window evaluation.
-    eval_stride = int(os.environ.get("EVAL_STRIDE", 256))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 512))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 16))
 
     # SWA (stochastic weight averaging).
@@ -425,16 +425,10 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        # Int6 per-row quantization: [-31, 31] range stored in int8
+        scale = t32.abs().amax(dim=1) / 31.0
+        scale = scale.clamp_min(1e-8)
+        q = (t32 / scale.unsqueeze(1)).round().clamp(-31, 31).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
     # Vectors / scalars use a simpler per-tensor scale.
@@ -470,6 +464,14 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = t
             stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        # tok_emb: store as FP16 passthrough (skip quantization)
+        if "tok_emb" in name:
+            kept = t.to(dtype=torch.float16).contiguous()
+            passthrough[name] = kept
+            passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
 
         # Small float tensors are cheap enough to keep directly. We still downcast
@@ -851,6 +853,18 @@ class GPT(nn.Module):
 
 
 # -----------------------------
+# INT6 FAKE QUANTIZATION (QAT)
+# -----------------------------
+
+class Int6FakeQuant(nn.Module):
+    def forward(self, w: Tensor) -> Tensor:
+        scale = w.abs().amax(dim=-1, keepdim=True) / 31.0
+        scale = scale.clamp(min=1e-8)
+        w_q = (w / scale).round().clamp(-31, 31) * scale
+        return w + (w_q - w).detach()
+
+
+# -----------------------------
 # TRAINING
 # -----------------------------
 
@@ -966,6 +980,12 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+
+    # Apply int6 fake quantization (QAT) to all Linear weights except tok_emb
+    for name, module in base_model.named_modules():
+        if isinstance(module, nn.Linear) and "tok_emb" not in name:
+            torch.nn.utils.parametrize.register_parametrization(module, "weight", Int6FakeQuant())
+
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1218,6 +1238,11 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
+
+    # Remove QAT parametrizations before serialization
+    for module in base_model.modules():
+        if hasattr(module, "parametrizations"):
+            torch.nn.utils.parametrize.remove_parametrizations(module, "weight", leave_parametrized=False)
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
