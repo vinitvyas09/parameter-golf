@@ -483,8 +483,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        int_range = 16 if "mlp" in name else 31
-        q, s = quantize_float_tensor(t, int_range=int_range)
+        q, s = quantize_float_tensor(t, int_range=31)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -864,12 +863,6 @@ class Int6FakeQuant(nn.Module):
         w_q = (w / scale).round().clamp(-31, 31) * scale
         return w + (w_q - w).detach()
 
-class Int5FakeQuant(nn.Module):
-    def forward(self, w: Tensor) -> Tensor:
-        scale = w.abs().amax(dim=-1, keepdim=True) / 16.0
-        scale = scale.clamp(min=1e-8)
-        w_q = (w / scale).round().clamp(-16, 16) * scale
-        return w + (w_q - w).detach()
 
 
 # -----------------------------
@@ -990,13 +983,9 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
 
     # Apply fake quantization (QAT) to all Linear weights except tok_emb
-    # Int5 for MLP layers (c_fc, c_proj in MLP), Int6 for attention layers
     for name, module in base_model.named_modules():
         if isinstance(module, nn.Linear) and "tok_emb" not in name:
-            if "mlp" in name:
-                torch.nn.utils.parametrize.register_parametrization(module, "weight", Int5FakeQuant())
-            else:
-                torch.nn.utils.parametrize.register_parametrization(module, "weight", Int6FakeQuant())
+            torch.nn.utils.parametrize.register_parametrization(module, "weight", Int6FakeQuant())
 
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
