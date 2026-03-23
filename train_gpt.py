@@ -87,6 +87,10 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
 
+    # Sliding-window evaluation.
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 256))
+    eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 16))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -279,6 +283,99 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    """Sliding-window evaluation: score overlapping windows and count only
+    the last `stride` positions of each window (except the first window
+    at each sequence, which scores all positions)."""
+    stride = args.eval_stride
+    seq_len = args.train_seq_len
+    batch_seqs = args.eval_batch_seqs
+
+    total_seqs = (val_tokens.numel() - 1) // seq_len
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    with torch.inference_mode():
+        for seq_idx in range(seq_start, seq_end, batch_seqs):
+            actual_batch = min(batch_seqs, seq_end - seq_idx)
+            # For each sequence, build sliding windows
+            for offset in range(0, seq_len, stride):
+                if offset + seq_len > seq_len * 2 - 1:
+                    break  # no more room
+                # Gather windows for the batch
+                xs = []
+                ys = []
+                for b in range(actual_batch):
+                    s = seq_idx + b
+                    raw_start = s * seq_len + offset
+                    raw_end = raw_start + seq_len + 1
+                    if raw_end > val_tokens.numel():
+                        continue
+                    chunk = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+                    xs.append(chunk[:-1])
+                    ys.append(chunk[1:])
+                if not xs:
+                    continue
+                x = torch.stack(xs)  # (B, seq_len)
+                y = torch.stack(ys)  # (B, seq_len)
+
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    raw = model.module if isinstance(model, DDP) else model
+                    logits = raw.forward_logits(x)  # (B, seq_len, vocab)
+
+                # Determine scored positions
+                if offset == 0:
+                    score_start = 0
+                else:
+                    score_start = seq_len - stride
+
+                scored_logits = logits[:, score_start:, :].float()
+                scored_targets = y[:, score_start:]
+
+                loss = F.cross_entropy(
+                    scored_logits.reshape(-1, scored_logits.size(-1)),
+                    scored_targets.reshape(-1),
+                    reduction="sum",
+                )
+                n_scored = scored_targets.numel()
+                val_loss_sum += loss.to(torch.float64)
+                val_token_count += n_scored
+
+                # Byte counting on scored positions only
+                prev_ids = x[:, score_start:].reshape(-1)
+                tgt_ids = scored_targets.reshape(-1)
+                token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                val_byte_count += token_bytes.to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -726,6 +823,28 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        """Return logits without computing loss."""
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        x = self.final_norm(x)
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(x)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
 
 # -----------------------------
 # TRAINING
@@ -1103,18 +1222,16 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
+    if args.eval_stride > 0 and args.eval_stride < args.train_seq_len:
+        q_val_loss, q_val_bpb = eval_val_sliding(
+            args, model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+    else:
+        q_val_loss, q_val_bpb = eval_val(
+            args, model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
     torch.cuda.synchronize()
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
