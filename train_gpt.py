@@ -88,7 +88,7 @@ class Hyperparameters:
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
 
     # Sliding-window evaluation.
-    eval_stride = int(os.environ.get("EVAL_STRIDE", 512))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 256))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 16))
 
     # SWA (stochastic weight averaging).
