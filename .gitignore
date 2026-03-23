@@ -9,3 +9,17 @@ data/docs_selected.jsonl
 .mypy_cache/
 .venv
 logs/
+
+# Parameter Golf run-state (two-agent loop)
+backward-looking.md
+forward-looking.md
+current_dev_task.md
+last_run_result.md
+orchestrator.log
+run.log
+STOP
+results.tsv
+final_model.pt
+final_model*.ptz
+logs/
+.claude/
