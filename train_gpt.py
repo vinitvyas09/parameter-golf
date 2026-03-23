@@ -93,7 +93,7 @@ class Hyperparameters:
 
     # SWA (stochastic weight averaging).
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
-    swa_every = int(os.environ.get("SWA_EVERY", 25))
+    swa_every = int(os.environ.get("SWA_EVERY", 15))
 
 # -----------------------------
 # MUON OPTIMIZER 
